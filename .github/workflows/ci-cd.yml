@@ -1,0 +1,241 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '21'
+
+jobs:
+
+  # 1. BUILD E TESTES (verificação dinâmica)
+  build-test:
+    name: Build e testes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v4
+
+      - name: Instalar o Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Compilar e rodar os testes (JUnit + MockMvc)
+        run: |
+          chmod +x mvnw
+          ./mvnw -B verify
+
+      - name: Publicar relatório dos testes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relatorio-testes
+          path: target/surefire-reports/
+          retention-days: 7
+
+      - name: Publicar o .jar gerado
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarefas-jar
+          path: target/tarefas.jar
+          retention-days: 7
+
+  # 2. ANÁLISE ESTÁTICA: Checkstyle + revisão de dependências
+  analise-estatica:
+    name: Análise estática (Checkstyle)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v4
+
+      - name: Instalar o Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Checkstyle (padrão de código)
+        run: |
+          chmod +x mvnw
+          ./mvnw -B checkstyle:check
+
+      - name: Dependency Review (vulnerabilidades em dependências novas)
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
+  # 3. ANÁLISE ESTÁTICA DE SEGURANÇA: CodeQL (SAST do GitHub)
+  codeql:
+    name: Análise de segurança (CodeQL)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v4
+
+      - name: Instalar o Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - name: Inicializar CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java-kotlin
+          build-mode: manual
+          queries: security-and-quality
+
+      - name: Compilar para análise
+        run: |
+          chmod +x mvnw
+          ./mvnw -B compile -DskipTests
+
+      - name: Executar análise CodeQL
+        uses: github/codeql-action/analyze@v3
+
+  # 4. DOCKER: gera a imagem e publica no GitHub Container Registry
+  docker:
+    name: Build da imagem Docker
+    runs-on: ubuntu-latest
+    needs: [build-test, analise-estatica, codeql]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Baixar o código
+        uses: actions/checkout@v4
+
+      - name: Definir nome da imagem
+        id: meta
+        run: |
+          # o registry exige nome em minúsculas
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=${IMAGE}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "latest=${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build da imagem
+        run: docker build -t ${{ steps.meta.outputs.image }} -t ${{ steps.meta.outputs.latest }} .
+
+      - name: Login no GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publicar a imagem
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push ${{ steps.meta.outputs.image }}
+          docker push ${{ steps.meta.outputs.latest }}
+
+  # 5. AMBIENTE 1: STAGING (homologação)
+  deploy-staging:
+    name: Deploy em staging
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.event_name != 'pull_request'
+    environment:
+      name: staging
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Login no GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Subir a aplicação em staging
+        run: |
+          docker run -d --name app-staging -p 8080:8080 \
+            -e APP_ENV=staging ${{ needs.docker.outputs.image }}
+          # espera o Spring Boot subir (até 60s)
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/actuator/health; then
+              echo; echo "Aplicação no ar"; exit 0
+            fi
+            sleep 2
+          done
+          docker logs app-staging
+          exit 1
+
+      - name: Smoke test (verificação dinâmica dos endpoints)
+        run: |
+          curl -sf http://localhost:8080/ | grep '"ambiente":"staging"'
+          curl -sf -X POST http://localhost:8080/api/tarefas \
+            -H 'Content-Type: application/json' \
+            -d '{"titulo":"tarefa de teste"}' | grep '"id":1'
+          curl -sf http://localhost:8080/api/tarefas | grep 'tarefa de teste'
+          curl -sf -X PATCH http://localhost:8080/api/tarefas/1/concluir | grep '"concluida":true'
+          echo "Smoke test OK"
+
+      - name: OWASP ZAP (teste dinâmico de segurança - DAST)
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: http://localhost:8080
+          allow_issue_writing: false
+          fail_action: false
+          artifact_name: relatorio-zap
+
+      - name: Deploy no servidor de staging
+        env:
+          DEPLOY_HOOK: ${{ secrets.DEPLOY_HOOK_URL }}
+        run: |
+          if [ -z "$DEPLOY_HOOK" ]; then
+            echo "::warning::Secret DEPLOY_HOOK_URL não configurado em staging; deploy remoto ignorado."
+          else
+            curl -sf -X POST "$DEPLOY_HOOK"
+            echo "Deploy de staging disparado"
+          fi
+
+  # 6. AMBIENTE 2: PRODUÇÃO (espera aprovação manual)
+  deploy-production:
+    name: Deploy em produção
+    runs-on: ubuntu-latest
+    needs: [docker, deploy-staging]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    environment:
+      name: production
+    steps:
+      - name: Deploy no servidor de produção
+        env:
+          DEPLOY_HOOK: ${{ secrets.DEPLOY_HOOK_URL }}
+        run: |
+          echo "Publicando a imagem ${{ needs.docker.outputs.image }} em produção"
+          if [ -z "$DEPLOY_HOOK" ]; then
+            echo "::warning::Secret DEPLOY_HOOK_URL não configurado em production; deploy remoto ignorado."
+          else
+            curl -sf -X POST "$DEPLOY_HOOK"
+            echo "Deploy de produção disparado"
+          fi
+
+      - name: Resumo do deploy
+        run: |
+          {
+            echo "## Deploy em produção concluído"
+            echo "- Imagem: \`${{ needs.docker.outputs.image }}\`"
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Responsável: ${{ github.actor }}"
+          } >> "$GITHUB_STEP_SUMMARY"

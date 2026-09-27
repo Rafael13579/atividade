@@ -48,6 +48,20 @@
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
+
+            <!-- Análise estática de estilo: ./mvnw checkstyle:check -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-checkstyle-plugin</artifactId>
+                <version>3.6.0</version>
+                <configuration>
+                    <configLocation>google_checks.xml</configLocation>
+                    <consoleOutput>true</consoleOutput>
+                    <includeTestSourceDirectory>true</includeTestSourceDirectory>
+                    <!-- google_checks marca tudo como "warning": mostra os avisos sem quebrar o build -->
+                    <violationSeverity>error</violationSeverity>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 </project>
